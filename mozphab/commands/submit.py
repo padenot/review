@@ -99,6 +99,7 @@ def show_commit_stack(
     validate: bool = True,
     show_rev_urls: bool = False,
     show_updated_only: bool = False,
+    force: bool = False
 ):
     """Log the commit stack in a human readable form."""
 
@@ -180,6 +181,7 @@ def show_commit_stack(
                     and not reviewers_added
                     and not bug_id_changed
                     and not revision_is_closed
+                    and not force
                 ):
                     commit.submit = False
 
@@ -515,7 +517,7 @@ def _submit(repo: Repository, args: argparse.Namespace):
     logger.warning(f"Submitting {commit_count} commit{'s'[:commit_count^1]} {status}")
 
     # Validate commit stack is suitable for review.
-    show_commit_stack(commits, args, validate=True)
+    show_commit_stack(commits, args, validate=True, force=args.force)
     try:
         with wait_message("Checking commits.."):
             repo.check_commits_for_submit(commits, require_bug=not args.no_bug)
@@ -690,7 +692,8 @@ def _submit(repo: Repository, args: argparse.Namespace):
 
     logger.warning("\nCompleted")
     show_commit_stack(
-        commits, args, validate=False, show_rev_urls=True, show_updated_only=True
+        commits, args, validate=False, show_rev_urls=True,
+        show_updated_only=True, force=args.force
     )
     telemetry().submission.process_time.stop()
 
