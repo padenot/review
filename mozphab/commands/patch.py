@@ -31,6 +31,77 @@ def get_base_ref(diff: dict) -> Optional[str]:
             return ref["identifier"]
 
 
+def get_patch_date(revision: dict, diff: dict) -> Optional[int]:
+    """Return the most recent known timestamp for a patch.
+
+    A revision can be updated after a diff is created (new diffs, edits),
+    so the diff's own `dateCreated` isn't necessarily the most current
+    timestamp -- take the latest of the diff's creation date and the
+    revision's last-modified date.
+    """
+    dates = [
+        diff["fields"].get("dateCreated"),
+        revision["fields"].get("dateModified"),
+    ]
+    dates = [d for d in dates if d]
+    return max(dates) if dates else None
+
+
+def resolve_base_node(
+    repo: Repository, base_node: str, before: Optional[int] = None
+) -> str:
+    """Resolve the commit to apply a patch to when using the rebase strategy.
+
+    Uses the diff's original base commit if it's public (landed). The base
+    commit may not be public, eg. because it only exists as part of another,
+    unlanded patch stack -- in that case fetching from upstream will never
+    find it, so fall back to the most recent commit known to have landed on
+    mozilla-central at or before `before` (the patch's own timestamp), so we
+    don't rebase onto changes that landed after the patch was written.
+    """
+    fetched = False
+
+    def ensure_fetched():
+        nonlocal fetched
+        if not fetched:
+            with wait_message("Fetching from upstream.."):
+                repo.fetch_from_upstream()
+            fetched = True
+
+    try:
+        with wait_message("Checking base revision %s.." % short_node(base_node)):
+            resolved = repo.check_node(base_node)
+    except NotFoundError:
+        ensure_fetched()
+        try:
+            with wait_message("Re-checking base revision %s.." % short_node(base_node)):
+                resolved = repo.check_node(base_node)
+        except NotFoundError:
+            resolved = None
+
+    if resolved is not None and repo.is_public(resolved):
+        return resolved
+
+    ensure_fetched()
+    with wait_message("Looking for the latest landed revision.."):
+        landing_node = repo.get_latest_landing_node(before=before)
+
+    if not landing_node:
+        raise Error(
+            "Base revision %s is not a public commit, and no landed "
+            "mozilla-central revision could be found to rebase onto."
+            % short_node(base_node)
+        )
+
+    logger.warning(
+        "Base revision %s is not public (it may belong to another, unlanded "
+        "patch stack). Applying the patch at %s instead.",
+        short_node(base_node),
+        short_node(landing_node),
+    )
+    return landing_node
+
+
 def get_diff_by_id(diff_id: int) -> tuple[str, dict]:
     """Retrieves a diff from Phabricator
 
@@ -358,32 +429,44 @@ def patch(repo: Repository, args: argparse.Namespace):
                 )
 
     base_node = None
+    target_node = None
+
     if not args.raw:
         args.apply_to = args.apply_to or config.apply_patch_to
 
+        # Always apply to the diff's original base first, then rebase to target.
+        base_diff = diffs[revs[0]["fields"]["diffPHID"]]
+        base_node = get_base_ref(base_diff)
+
+        if not base_node:
+            raise Error(
+                "Base commit not found in diff. "
+                "Cannot apply patch without base revision."
+            )
+
+        # Resolve the base node to apply the patch to: the diff's original
+        # base if it's public, otherwise the latest landed revision.
+        base_node = resolve_base_node(
+            repo, base_node, before=get_patch_date(revs[0], base_diff)
+        )
+
+        # Determine target node for rebase (if different from base)
         if args.apply_to == "base":
-            base_node = get_base_ref(diffs[revs[0]["fields"]["diffPHID"]])
-
-            if not base_node:
-                raise Error(
-                    "Base commit not found in diff. "
-                    "Use `--apply-to here` to patch current commit."
-                )
-        elif args.apply_to != "here":
-            base_node = args.apply_to
-
-        if args.apply_to != "here":
+            # No rebase needed, target is same as base
+            target_node = None
+        elif args.apply_to == "here":
+            # Rebase to current location
+            target_node = repo.get_current_node()
+        else:
+            # Rebase to specified node
+            target_node = args.apply_to
             try:
-                with wait_message("Checking %s.." % short_node(base_node)):
-                    base_node = repo.check_node(base_node)
+                with wait_message("Checking target %s.." % short_node(target_node)):
+                    target_node = repo.check_node(target_node)
             except NotFoundError as e:
-                msg = "Unknown revision: %s" % short_node(base_node)
+                msg = "Unknown target revision: %s" % short_node(target_node)
                 if str(e):
                     msg += "\n%s" % str(e)
-
-                if args.apply_to == "base":
-                    msg += "\nUse --apply-to to set the base commit."
-
                 raise Error(msg)
 
         branch_name = resolve_branch_name(args, config, rev_id)
@@ -452,6 +535,17 @@ def patch(repo: Repository, args: argparse.Namespace):
             logger.info("D%s applied", rev["id"])
 
     logger.warning("D%s applied", rev_id)
+
+    # If the target is different from the base, rebase the applied patches
+    # (base_node..HEAD) onto it.
+    if not args.raw and target_node:
+        try:
+            with wait_message("Rebasing to %s.." % short_node(target_node)):
+                repo.rebase_commit(base_node, target_node)
+
+            logger.info("Successfully rebased patches to %s", short_node(target_node))
+        except subprocess.CalledProcessError:
+            raise Error("Failed to rebase patches to target revision")
 
 
 def check_revision_id(value: str) -> int:

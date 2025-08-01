@@ -13,6 +13,7 @@ import sys
 import time
 import uuid
 from contextlib import suppress
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import (
     Dict,
@@ -45,6 +46,13 @@ from .subprocess_wrapper import debug_log_command
 from .telemetry import telemetry
 
 MINIMUM_MERCURIAL_VERSION = Version("4.3.3")
+
+# Commit messages used by the bots that merge autoland into mozilla-central.
+# The naming changed when the repos were renamed from mozilla-central/autoland
+# to firefox-main/firefox-autoland.
+LANDING_MERGE_DESC_REVSET = (
+    "re:^Merge (autoland to mozilla-central|firefox-autoland to firefox-main)$"
+)
 
 
 class Mercurial(Repository):
@@ -538,6 +546,26 @@ class Mercurial(Repository):
 
         return node
 
+    def is_public(self, node: str) -> bool:
+        """Return `True` if `node` is a public (landed) commit."""
+        return self.hg_log(node, select="phase", split=False) == "public"
+
+    def get_latest_landing_node(self, before: Optional[int] = None) -> Optional[str]:
+        """Return the most recent autoland-to-mozilla-central merge in the repo."""
+        branch = self.get_repo_head_branch()
+        scope = f"ancestors({branch})" if branch else "public()"
+        if before:
+            before_str = datetime.fromtimestamp(before, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S+0000"
+            )
+            scope = f"{scope} and date('<{before_str}')"
+        revset = f"last({scope} and desc('{LANDING_MERGE_DESC_REVSET}'))"
+        return self.hg_log(revset, split=False) or None
+
+    def get_current_node(self) -> str:
+        """Return the node currently checked out in the working directory."""
+        return self.hg_log(".", split=False)
+
     def checkout(self, node: str):
         self.hg(["update", "--quiet", node])
 
@@ -758,6 +786,16 @@ class Mercurial(Repository):
         self.hg(
             ["rebase"] + ["--source", source_commit.node] + ["--dest", dest_commit.node]
         )
+
+    def fetch_from_upstream(self):
+        """Fetch latest changes from upstream remote without merging."""
+        logger.info("Fetching from upstream...")
+        try:
+            # Pull without updating working directory
+            self.hg_call(["pull"])
+            logger.info("Successfully fetched from upstream")
+        except CommandError as e:
+            raise Error(f"Failed to fetch from upstream: {str(e)}")
 
     def uplift_commits(self, dest: str, commits: List[Commit]) -> List[Commit]:
         try:

@@ -351,6 +351,18 @@ class Jujutsu(Repository):
         """Return a Mercurial node if Cinnabar is required."""
         return self.__git_repo.get_public_node(node)
 
+    def is_public(self, node: str) -> bool:
+        """Return `True` if `node` is an ancestor of an official remote branch."""
+        return self.__git_repo.is_public(node)
+
+    def get_latest_landing_node(self, before: Optional[int] = None) -> Optional[str]:
+        """Return the most recent autoland-to-mozilla-central merge on a remote."""
+        return self.__git_repo.get_latest_landing_node(before=before)
+
+    def get_current_node(self) -> str:
+        """Return the node currently checked out in the working directory."""
+        return self.__cli_log(template='commit_id ++ "\\n"', revset="@", split=False)
+
     # TODO: Functionality to make `local_uplift_if_possible` work?
 
     def is_worktree_clean(self) -> bool:
@@ -468,6 +480,16 @@ class Jujutsu(Repository):
         self, diff: str, body: str, author: Optional[str], author_date: Optional[int]
     ) -> str:
         return diff
+
+    def fetch_from_upstream(self):
+        """Fetch latest changes from upstream remote without merging."""
+        logger.info("Fetching from upstream...")
+        try:
+            # Jujutsu uses 'jj git fetch' to fetch from remote
+            check_call(["jj", "git", "fetch"])
+            logger.info("Successfully fetched from upstream")
+        except subprocess.CalledProcessError as e:
+            raise Error(f"Failed to fetch from upstream: {str(e)}")
 
     # ----
     # Methods private to this abstraction.

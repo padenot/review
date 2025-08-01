@@ -180,6 +180,23 @@ class Repository(object):
         Raises NotFoundError if node not found in the repository.
         """
 
+    def is_public(self, node: str) -> bool:
+        """Return `True` if `node` has landed on an official remote/branch.
+
+        A node that only exists locally (eg. part of another, unlanded
+        patch stack) is not public, even if it's present in the repository.
+        """
+
+    def get_latest_landing_node(self, before: Optional[int] = None) -> Optional[str]:
+        """Return the most recent node known to have landed on mozilla-central.
+
+        Used as a rebase target when a patch's original base commit isn't a
+        public node, eg. because it's part of a different, unlanded stack.
+        If `before` (a Unix timestamp) is given, only consider nodes that
+        landed at or before that time. Returns `None` if no such node can be
+        determined.
+        """
+
     def checkout(self, node):
         """Checkout/Update to specified node."""
 
@@ -191,6 +208,9 @@ class Repository(object):
 
     def is_descendant(self, node: str) -> bool:
         """Return `True` if the repository revset is descendant from `node`."""
+
+    def get_current_node(self) -> str:
+        """Return the node currently checked out in the working directory."""
 
     def get_repo_head_branch(self) -> Optional[str]:
         """Return the expected branch/head for the current Phabricator repo.
@@ -216,6 +236,9 @@ class Repository(object):
         self, diff: str, body: str, author: Optional[str], author_date: Optional[int]
     ):
         """Format a patch appropriate for importing."""
+
+    def fetch_from_upstream(self):
+        """Fetch latest changes from upstream remote without merging."""
 
     def check_commits_for_submit(self, commits: List[Commit]):
         """Validate the list of commits are okay to submit."""

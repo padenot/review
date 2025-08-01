@@ -155,6 +155,7 @@ def test_patch_no_commit(
     test_file.unlink()
 
 
+@mock.patch("mozphab.git.Git.is_public", return_value=True)
 @mock.patch("mozphab.conduit.ConduitAPI.get_revisions")
 @mock.patch("mozphab.conduit.ConduitAPI.get_diffs")
 @mock.patch("mozphab.conduit.ConduitAPI.call")
@@ -162,6 +163,7 @@ def test_git_patch_with_commit(
     m_call_conduit,
     m_get_diffs,
     m_get_revs,
+    m_git_is_public,
     in_process,
     git_repo_path,
 ):

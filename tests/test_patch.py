@@ -11,6 +11,7 @@ import pytest
 from mozphab import exceptions, helpers, mozphab
 from mozphab.commands import patch
 from mozphab.config import Config
+from mozphab.repository import Repository
 
 from .conftest import with_stack_graph
 
@@ -198,6 +199,109 @@ def test_base_ref():
     assert patch.get_base_ref(diff) == "sha1"
 
 
+def _repo_mock():
+    return mock.create_autospec(Repository, instance=True)
+
+
+def test_resolve_base_node_public():
+    # Base is found locally and is public: use it directly, no fetch needed.
+    repo = _repo_mock()
+    repo.check_node.return_value = "sha111"
+    repo.is_public.return_value = True
+
+    assert patch.resolve_base_node(repo, "sha111") == "sha111"
+    repo.fetch_from_upstream.assert_not_called()
+    repo.get_latest_landing_node.assert_not_called()
+
+
+def test_resolve_base_node_fetches_and_finds_public_base():
+    # Base isn't found locally at first, but a fetch reveals it and it's public.
+    repo = _repo_mock()
+    repo.check_node.side_effect = [exceptions.NotFoundError(), "sha111"]
+    repo.is_public.return_value = True
+
+    assert patch.resolve_base_node(repo, "sha111") == "sha111"
+    repo.fetch_from_upstream.assert_called_once()
+    repo.get_latest_landing_node.assert_not_called()
+
+
+def test_resolve_base_node_falls_back_when_never_found():
+    # Base is never found, even after fetching: it belongs to another,
+    # unlanded stack. Fall back to the latest landed revision.
+    repo = _repo_mock()
+    repo.check_node.side_effect = exceptions.NotFoundError()
+    repo.get_latest_landing_node.return_value = "landing_sha"
+
+    assert patch.resolve_base_node(repo, "sha111") == "landing_sha"
+    repo.fetch_from_upstream.assert_called_once()
+    repo.is_public.assert_not_called()
+
+
+def test_resolve_base_node_falls_back_when_not_public():
+    # Base is found locally, but isn't public (eg. from another patch stack
+    # the user has checked out). Fall back to the latest landed revision.
+    repo = _repo_mock()
+    repo.check_node.return_value = "sha111"
+    repo.is_public.return_value = False
+    repo.get_latest_landing_node.return_value = "landing_sha"
+
+    assert patch.resolve_base_node(repo, "sha111") == "landing_sha"
+    repo.fetch_from_upstream.assert_called_once()
+
+
+def test_resolve_base_node_raises_without_a_landing_node():
+    repo = _repo_mock()
+    repo.check_node.side_effect = exceptions.NotFoundError()
+    repo.get_latest_landing_node.return_value = None
+
+    with pytest.raises(exceptions.Error):
+        patch.resolve_base_node(repo, "sha111")
+
+
+def test_resolve_base_node_passes_before_to_landing_node_lookup():
+    # The fallback must be bounded by the patch's own timestamp, so we don't
+    # rebase onto something that landed after the patch was written.
+    repo = _repo_mock()
+    repo.check_node.side_effect = exceptions.NotFoundError()
+    repo.get_latest_landing_node.return_value = "landing_sha"
+
+    assert patch.resolve_base_node(repo, "sha111", before=1547806078) == "landing_sha"
+    repo.get_latest_landing_node.assert_called_once_with(before=1547806078)
+
+
+def test_get_patch_date():
+    # Only the diff's own creation date is available.
+    assert (
+        patch.get_patch_date(
+            {"fields": {}},
+            {"fields": {"dateCreated": 100}},
+        )
+        == 100
+    )
+
+    # The revision was updated (eg. a newer diff, or an edit) after this
+    # diff was created: the later, revision-level date wins.
+    assert (
+        patch.get_patch_date(
+            {"fields": {"dateModified": 200}},
+            {"fields": {"dateCreated": 100}},
+        )
+        == 200
+    )
+
+    # This diff is newer than the revision's recorded modification date.
+    assert (
+        patch.get_patch_date(
+            {"fields": {"dateModified": 100}},
+            {"fields": {"dateCreated": 200}},
+        )
+        == 200
+    )
+
+    # Neither date is available.
+    assert patch.get_patch_date({"fields": {}}, {"fields": {}}) is None
+
+
 @mock.patch("mozphab.conduit.ConduitAPI.call")
 @mock.patch("mozphab.git.Git.is_worktree_clean")
 @mock.patch("mozphab.commands.patch.config")
@@ -205,19 +309,31 @@ def test_base_ref():
 @mock.patch("mozphab.conduit.ConduitAPI.get_revisions")
 @mock.patch("mozphab.conduit.ConduitAPI.get_diffs")
 @mock.patch("mozphab.commands.patch.get_base_ref")
+@mock.patch("mozphab.commands.patch.get_patch_date")
 @mock.patch("mozphab.git.Git.before_patch")
 @mock.patch("mozphab.commands.patch.apply_patch")
 @mock.patch("mozphab.commands.patch.prepare_body")
 @mock.patch("mozphab.git.Git.apply_patch")
 @mock.patch("mozphab.git.Git.check_node")
+@mock.patch("mozphab.git.Git.is_public")
+@mock.patch("mozphab.git.Git.get_current_node")
+@mock.patch("mozphab.git.Git.rebase_commit")
+@mock.patch("mozphab.git.Git.fetch_from_upstream")
+@mock.patch("mozphab.git.Git.get_latest_landing_node")
 @mock.patch("builtins.print")
 def test_patch(
     m_print,
+    m_git_get_latest_landing_node,
+    m_git_fetch_from_upstream,
+    m_git_rebase_commit,
+    m_git_get_current_node,
+    m_git_is_public,
     m_git_check_node,
     m_git_apply_patch,
     m_prepare_body,
     m_apply_patch,
     m_git_before_patch,
+    m_get_patch_date,
     m_get_base_ref,
     m_get_diffs,
     m_get_revisions,
@@ -227,6 +343,10 @@ def test_patch(
     m_call_conduit,
     git,
 ):
+    # The diff's base is treated as public by default, so `resolve_base_node`
+    # uses it directly without needing to fetch or fall back.
+    m_git_is_public.return_value = True
+    m_get_patch_date.return_value = 1547806078
     mozphab.conduit.set_repo(git)
 
     class Args:
@@ -394,10 +514,12 @@ def test_patch(
 
     m_get_base_ref.reset_mock()
     m_apply_patch.reset_mock()
-    # --apply_to head
+    m_git_rebase_commit.reset_mock()
+    # --apply_to head: the patch is still applied at the diff's resolved base;
+    # "head" only becomes the rebase target, applied after patching.
     git.args = Args(apply_to="head")
     patch.patch(git, git.args)
-    m_get_base_ref.assert_not_called()
+    m_get_base_ref.assert_called_once()
     m_git_apply_patch.assert_called_once_with(
         "raw",
         "commit message",
@@ -405,22 +527,32 @@ def test_patch(
         1547806078,
     )
     m_apply_patch.assert_not_called()
+    m_git_rebase_commit.assert_called_once()
 
     m_git_before_patch.reset_mock()
+    m_git_rebase_commit.reset_mock()
     node = "abcdef"
     m_git_check_node.return_value = node
-    # --applyto NODE
+    # --applyto NODE: base is still resolved from the diff (also "abcdef"
+    # here, since `check_node` is mocked to always return it), and NODE
+    # becomes the rebase target.
     git.args = Args(apply_to=node)
     patch.patch(git, git.args)
     m_git_before_patch.assert_called_once_with(node, "phab-D1")
+    m_git_rebase_commit.assert_called_once()
 
     m_git_before_patch.reset_mock()
-    # --applyto here
+    m_git_rebase_commit.reset_mock()
+    m_git_get_current_node.return_value = "current_sha"
+    # --applyto here: the patch is applied at the resolved base, then
+    # rebased onto whatever is currently checked out.
     git.args = Args(apply_to="here")
     patch.patch(git, git.args)
-    m_git_before_patch.assert_called_once_with(None, "phab-D1")
+    m_git_before_patch.assert_called_once_with(node, "phab-D1")
+    m_git_rebase_commit.assert_called_once_with(node, "current_sha")
 
     m_git_before_patch.reset_mock()
+    m_git_rebase_commit.reset_mock()
     # --name NAME
     git.args = Args(name="feature")
     patch.patch(git, git.args)
@@ -467,13 +599,14 @@ def test_patch(
     ]
     m_print.assert_has_calls((mock.call("raw2"), mock.call("raw1")))
 
-    # node not found
+    # node not found, and no landed revision to fall back to either
     m_get_revisions.side_effect = None
     m_git_check_node.side_effect = exceptions.NotFoundError
+    m_git_get_latest_landing_node.return_value = None
     git.args = Args(apply_to=node)
-    with pytest.raises(exceptions.Error) as e:
+    with pytest.raises(exceptions.Error):
         patch.patch(git, git.args)
-        assert "Unknown revision: %s\nERROR" % node in e.msg
+    m_git_fetch_from_upstream.assert_called_once()
 
     # successors
     m_get_revisions.reset_mock()
