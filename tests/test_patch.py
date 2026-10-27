@@ -296,6 +296,7 @@ def test_get_patch_date():
 @mock.patch("mozphab.commands.patch.get_base_ref")
 @mock.patch("mozphab.commands.patch.get_patch_date")
 @mock.patch("mozphab.git.Git.before_patch")
+@mock.patch("mozphab.git.Git.after_patch")
 @mock.patch("mozphab.commands.patch.apply_patch")
 @mock.patch("mozphab.commands.patch.prepare_body")
 @mock.patch("mozphab.git.Git.apply_patch")
@@ -327,6 +328,7 @@ def test_patch(
     m_git_apply_patch,
     m_prepare_body,
     m_apply_patch,
+    m_git_after_patch,
     m_git_before_patch,
     m_get_patch_date,
     m_get_base_ref,
@@ -415,6 +417,7 @@ def test_patch(
     m_apply_patch.assert_not_called()
     m_get_base_ref.assert_called_once()
     m_git_before_patch.assert_called_once_with("sha111", "phab-D1")
+    m_git_after_patch.assert_called_once()
 
     m_git_apply_patch.reset_mock()
     m_get_diffs.return_value = {"DIFFPHID-1": DIFF_1}
@@ -489,10 +492,13 @@ def test_patch(
     m_get_revisions.assert_called_once()
 
     m_git_before_patch.reset_mock()
+    m_git_after_patch.reset_mock()
     # --no_commit
     git.args = Args(no_commit=True)
     patch.patch(git, git.args)
     m_git_before_patch.assert_called_once()
+    # The target is checked out before the patch is applied to the working tree.
+    m_git_after_patch.assert_called_once()
     m_git_apply_patch.assert_not_called()
     m_apply_patch.assert_called_once_with("raw", "x")
     m_git_before_patch.assert_called_once_with("sha111", None)
@@ -600,13 +606,16 @@ def test_patch(
     m_git_discard_patch_attempt.reset_mock()
     m_git_rebase_node.reset_mock()
 
-    # A conflicting rebase is aborted rather than left in progress.
+    # A conflicting rebase is aborted rather than left in progress, and the
+    # patches are checked out where they did apply.
+    m_git_after_patch.reset_mock()
     m_git_apply_patch.side_effect = [exceptions.CommandError("boom"), mock.DEFAULT]
     m_git_rebase_node.side_effect = exceptions.CommandError("boom")
     git.args = Args(apply_to="current_sha")
     with pytest.raises(exceptions.Error, match="original branch was original-branch"):
         patch.patch(git, git.args)
     m_git_abort_rebase.assert_called_once()
+    m_git_after_patch.assert_called_once()
     m_git_apply_patch.side_effect = None
     m_git_rebase_node.side_effect = None
     m_git_rebase_node.reset_mock()
@@ -615,6 +624,7 @@ def test_patch(
     # Declining the fallback for `--apply-to here` must leave the checkout
     # alone, without fetching or looking for an older revision.
     m_git_before_patch.reset_mock()
+    m_git_after_patch.reset_mock()
     m_git_check_node.reset_mock()
     m_git_apply_patch.side_effect = exceptions.CommandError("boom")
     m_prompt.return_value = "No"
@@ -633,6 +643,7 @@ def test_patch(
         "current_sha", keep_branch=True, original_branch="original-branch"
     )
     m_git_rebase_node.assert_not_called()
+    m_git_after_patch.assert_not_called()
     m_git_discard_patch_attempt.reset_mock()
 
     # Accepting the offer retains the existing retry and rebase behavior.

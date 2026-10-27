@@ -8,8 +8,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import uuid
-from contextlib import suppress
 from datetime import datetime
 from functools import lru_cache
 
@@ -81,8 +81,13 @@ class Git(Repository):
         self.revset: tuple[str, str] | None = None
         # Set by `before_submit` to the branch to return to afterwards.
         self.branch = ""
-        # Name of the branch created by `before_patch`, if any.
-        self.patch_branch_name = None
+        # Environment overriding the identity of the commits `patch` creates.
+        self.ident_env: dict[str, str] = {}
+        # Commit `before_patch` was given, the last commit created on top of
+        # it, and the name of the branch `after_patch` should create.
+        self._patch_base = ""
+        self._patch_tip = ""
+        self._patch_name: str | None = None
         # Cached result of `get_base_remotes`.
         self._base_remotes: list[str] | None = None
 
@@ -606,22 +611,31 @@ class Git(Repository):
             self.git_call(commands)
 
     def before_patch(self, node: str, name: str):
-        """Prepare repository to apply the patches.
+        """Prepare to commit the patches on top of `node`.
+
+        Nothing is checked out until `after_patch`, so a failed attempt leaves
+        the working tree untouched.
 
         Args:
             node - SHA1 of the base commit
             name - name of the branch to be created
         """
-        # Checking out the commit that is already checked out is a no-op that
-        # detaches HEAD from the branch it's on, so don't (eg. `--apply-to
-        # here`, or a target that resolves to the current commit).
-        needs_checkout = bool(node) and self._revparse(node) != self.get_current_node()
+        self._patch_base = self._revparse(node) if node else self.get_current_node()
+        self._patch_tip = self._patch_base
+        self._patch_name = name
+
+    def after_patch(self):
+        """Check out the commits created since `before_patch`.
+
+        Only the files that differ from the current checkout are written.
+        """
+        # Committing on the commit that is already checked out (eg. `--apply-to
+        # here`) keeps HEAD on the branch it's on, as `git commit` would.
+        on_head = self._patch_base == self.get_current_node()
 
         no_new_branch = self.args.no_branch or not config.create_branch
         is_detached_head = self._is_detached_head()
-        will_detach_head = no_new_branch and needs_checkout
-        # HEAD is already detached when applying at another base after a failed
-        # attempt, so there's nothing left to ask about the second time around.
+        will_detach_head = no_new_branch and not on_head
         if will_detach_head and not self.args.yes and not is_detached_head:
             res = prompt(
                 "Switching to the 'detached HEAD' state. Do you wish to continue?",
@@ -641,64 +655,79 @@ class Git(Repository):
                 "you may do so by calling `git checkout -b <new-branch-name>`"
             )
 
-        # Checkout sha
-        if needs_checkout:
-            with wait_message("Checking out %s.." % short_node(node)):
-                self.checkout(node)
-            logger.info("Checked out %s", short_node(node))
-
-        if name and not self.args.no_branch and config.create_branch:
-            branches = self.git_out(["branch", "--list", "%s*" % name])
+        tip = self._patch_tip
+        if self._patch_name and not no_new_branch:
+            branches = self.git_out(["branch", "--list", "%s*" % self._patch_name])
             branches = [re.sub("[ *]", "", b) for b in branches]
-            branch_name = name
+            branch_name = self._patch_name
             i = 0
             while branch_name in branches:
                 i += 1
-                branch_name = "%s_%s" % (name, i)
+                branch_name = "%s_%s" % (self._patch_name, i)
 
-            self.git_call(["checkout", "-q", "-b", branch_name])
+            with wait_message("Checking out %s.." % short_node(tip)):
+                self.git_call(["checkout", "-q", "-b", branch_name, tip])
             logger.info("Created branch %s", branch_name)
-            self.patch_branch_name = branch_name
+        elif on_head:
+            if tip != self._patch_base:
+                self.git_call(["reset", "--quiet", "--keep", tip])
+        else:
+            with wait_message("Checking out %s.." % short_node(tip)):
+                self.checkout(tip)
+            logger.info("Checked out %s", short_node(tip))
 
     def discard_patch_attempt(
-        self, node: str, *, keep_branch: bool = False, original_branch: str | None = None
+        self,
+        node: str,
+        *,
+        keep_branch: bool = False,
+        original_branch: str | None = None,
     ):
-        """Undo a failed patch attempt, returning the repository to `node`.
-
-        With `keep_branch`, reset the current branch without detaching HEAD.
-        Otherwise delete the branch `before_patch` created, leaving the commits
-        of the failed attempt unreachable.
-        """
-        if keep_branch:
-            if self.patch_branch_name and original_branch:
-                patch_branch_name = self.patch_branch_name
-                self.checkout(original_branch)
-                self.git_call(["branch", "--delete", "--force", patch_branch_name])
-                self.patch_branch_name = None
-            else:
-                self.git_call(["reset", "--hard", "--quiet", node])
-        elif self.patch_branch_name:
-            self.checkout(node)
-            self.git_call(["branch", "--delete", "--force", self.patch_branch_name])
-            self.patch_branch_name = None
-        else:
-            # Without a branch of our own, the commits landed on whatever HEAD
-            # pointed at, which can be a branch `before_patch` left in place
-            # (`--apply-to here`), so move that back rather than just detaching.
-            self.git_call(["reset", "--hard", "--quiet", node])
-            # Detach at `node`: the next attempt applies at another base, and
-            # would otherwise prompt about detaching mid-operation.
-            self.checkout(node)
+        """Nothing to undo: the commits of a failed attempt were never checked out."""
 
     def apply_patch(
         self, diff: str, body: str, author: str | None, author_date: int | None
     ):
-        # apply the patch as a binary file to ensure the correct line endings
-        # is used.
-        with temporary_binary_file(diff.encode("utf8")) as patch_file:
-            self.git_call(["apply", "--index", patch_file])
+        self._patch_tip = self.commit_patch(
+            self._patch_tip, diff, body, author, author_date
+        )
 
-        self.commit(body, author, author_date)
+    def commit_patch(
+        self,
+        parent: str,
+        diff: str,
+        body: str,
+        author: str | None,
+        author_date: int | None,
+    ) -> str:
+        """Commit `diff` on top of `parent` without touching the working tree.
+
+        Returns the SHA1 of the new commit.
+        """
+        with tempfile.TemporaryDirectory() as index_dir:
+            index_env = {"GIT_INDEX_FILE": os.path.join(index_dir, "index")}
+            self.git_out_text(["read-tree", parent], extra_env=index_env)
+            # apply the patch as a binary file to ensure the correct line endings
+            # is used.
+            with temporary_binary_file(diff.encode("utf8")) as patch_file:
+                self.git_out_text(
+                    ["apply", "--cached", patch_file], extra_env=index_env
+                )
+            tree = self.git_out_text(["write-tree"], extra_env=index_env)
+
+        env = dict(self.ident_env)
+        if author:
+            name, email = author.rsplit(" <", 1)
+            env["GIT_AUTHOR_NAME"] = name
+            env["GIT_AUTHOR_EMAIL"] = email.rstrip(">")
+        if author_date:
+            env["GIT_AUTHOR_DATE"] = "%s +0000" % author_date
+
+        with temporary_file(body.rstrip("\n") + "\n") as message_file:
+            return self.git_out_text(
+                ["commit-tree", "-p", parent, "-F", message_file, tree],
+                extra_env=env,
+            )
 
     def format_patch(
         self, diff: str, body: str, author: str | None, author_date: int | None
@@ -769,6 +798,7 @@ class Git(Repository):
             return self.git_out_text(
                 ["commit-tree", "-p", parent, "-F", message_file, tree_hash],
                 extra_env={
+                    **self.ident_env,
                     "GIT_AUTHOR_NAME": author_name,
                     "GIT_AUTHOR_EMAIL": author_email,
                     "GIT_AUTHOR_DATE": author_date,
@@ -827,14 +857,34 @@ class Git(Repository):
             stack_commit.node = new_parent_sha
 
     def rebase_node(self, source_node: str, dest_node: str):
-        self._rebase(dest_node, source_node)
+        """Rebase the commits created since `before_patch` onto `dest_node`."""
+        self._patch_tip = self.rebase_commits(source_node, self._patch_tip, dest_node)
+        self._patch_base = dest_node
 
-    def abort_rebase(self):
-        """Abort the rebase left in progress by a conflict."""
-        # A rebase that failed before starting (eg. on invalid arguments)
-        # leaves nothing to abort.
-        with suppress(CommandError):
-            self.git_call(["rebase", "--abort"])
+    def rebase_commits(self, source_node: str, tip: str, dest_node: str) -> str:
+        """Rebase `source_node..tip` onto `dest_node` without touching the working tree.
+
+        Returns the SHA1 of the rebased `tip`. Raises `CommandError` on conflicts.
+        """
+        new_tip = dest_node
+        for node in self.git_out(["rev-list", "--reverse", f"{source_node}..{tip}"]):
+            tree = self.git_out_text(
+                ["merge-tree", "--write-tree", f"--merge-base={node}^", new_tip, node]
+            )
+            author_name, author_email, author_date, message = self.git_out_text(
+                [
+                    "show",
+                    "--no-patch",
+                    "--format=format:%an%n%ae%n%ad%n%B",
+                    "--date=raw",
+                    node,
+                ],
+                strip=False,
+            ).split("\n", 3)
+            new_tip = self._commit_tree(
+                new_tip, tree, message, author_name, author_email, author_date
+            )
+        return new_tip
 
     def is_descendant(self, node: str) -> bool:
         try:

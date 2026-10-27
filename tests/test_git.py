@@ -14,8 +14,6 @@ from callee import Contains
 from mozphab import environment, exceptions, mozphab
 from mozphab.commits import Commit
 
-from .conftest import create_temp_fn
-
 
 @pytest.mark.parametrize(
     "revisions, expected",
@@ -500,171 +498,169 @@ def test_check_node(m_phab_vcs, m_git_is_node, m_hg2git, git):
     assert "git_aabbcc" == git.check_node(node)
 
 
+@mock.patch("mozphab.git.Git.get_current_node", return_value="current_sha")
+@mock.patch("mozphab.git.Git._revparse", side_effect=lambda node: node)
+@mock.patch("mozphab.git.Git.checkout")
+@mock.patch("mozphab.git.Git.git_call")
+def test_before_patch(m_git, m_checkout, m_revparse, m_get_current_node, git):
+    # Nothing is checked out until `after_patch`.
+    git.before_patch("sha1", "branch")
+    git.before_patch(None, "branch")
+    m_checkout.assert_not_called()
+    m_git.assert_not_called()
+
+
 @mock.patch("mozphab.git.Git.get_current_node")
-@mock.patch("mozphab.git.Git._revparse")
 @mock.patch("mozphab.git.Git._is_detached_head")
 @mock.patch("mozphab.git.Git.git_out")
 @mock.patch("mozphab.git.Git.checkout")
 @mock.patch("mozphab.git.Git.git_call")
 @mock.patch("mozphab.git.prompt")
 @mock.patch("mozphab.git.config")
-def test_before_patch(
+def test_after_patch(
     m_config,
     m_prompt,
     m_git,
     m_checkout,
     m_git_out,
     m_is_detached_head,
-    m_revparse,
     m_get_current_node,
     git,
     caplog: pytest.LogCaptureFixture,
 ):
     m_is_detached_head.return_value = False
-    m_revparse.side_effect = lambda node: node
     m_get_current_node.return_value = "current_sha"
 
-    class Args(argparse.Namespace):
-        def __init__(
-            self,
-            rev_id="D123",
-            nocommit=False,
-            raw=False,
-            applyto="base",
-            no_branch=False,
-            yes=False,
-        ):
-            self.rev_id = rev_id
-            self.nocommit = nocommit
-            self.raw = raw
-            self.applyto = applyto
-            self.no_branch = no_branch
-            self.yes = yes
+    def after_patch(base, name, tip=None, **args):
+        git.args = argparse.Namespace(**{"no_branch": False, "yes": False, **args})
+        git._patch_base = base
+        git._patch_tip = tip or base
+        git._patch_name = name
+        git.after_patch()
 
-    git.args = Args()
     m_git_out.side_effect = (["  branch"],)
-    git.before_patch("sha1", "branch")
-    m_checkout.assert_called_with("sha1")
-    m_git.assert_called_with(["checkout", "-q", "-b", "branch_1"])
-
-    m_git.reset_mock()
-    m_git_out.reset_mock()
-    m_checkout.reset_mock()
-
-    m_checkout.reset_mock()
-    m_git_out.side_effect = ("the branch name is not here",)
-    git.args = Args(applyto="here")
-    git.before_patch(None, "branchname")
+    after_patch("sha1", "branch", tip="tip1")
     m_checkout.assert_not_called()
+    m_git.assert_called_once_with(["checkout", "-q", "-b", "branch_1", "tip1"])
+    m_prompt.assert_not_called()
 
+    # Nothing committed (eg. `--no-commit`): check out the target.
     m_git.reset_mock()
-    m_checkout.reset_mock()
-    git.args = Args(applyto="abcdef", nocommit=True)
-    git.before_patch("abcdef", None)
+    after_patch("abcdef", None)
     m_checkout.assert_called_once_with("abcdef")
     m_git.assert_not_called()
+    m_prompt.assert_not_called()
 
-    m_git.reset_mock()
     m_checkout.reset_mock()
     caplog.clear()
-    git.args = Args(no_branch=True, yes=True)
-    git.before_patch("abcdef", "name")
-    m_checkout.assert_called_once()
+    after_patch("abcdef", "name", tip="tip1", no_branch=True, yes=True)
+    m_checkout.assert_called_once_with("tip1")
     m_git.assert_not_called()
+    m_prompt.assert_not_called()
     assert Contains("git checkout -b") in caplog.messages
 
-    m_git.reset_mock()
     m_checkout.reset_mock()
     caplog.clear()
-    git.args = Args(no_branch=True)
-    git.before_patch("abcdef", "name")
-    m_checkout.assert_called_once()
-    m_git.assert_not_called()
+    after_patch("abcdef", "name", tip="tip1", no_branch=True)
+    m_checkout.assert_called_once_with("tip1")
     m_prompt.assert_called_once()
     assert Contains("git checkout -b") in caplog.messages
 
-    m_git.reset_mock()
     m_checkout.reset_mock()
-    caplog.clear()
     m_prompt.reset_mock()
     m_config.create_branch = False
-    git.args = Args()
-    git.before_patch("abcdef", "name")
-    m_checkout.assert_called_once()
+    after_patch("abcdef", "name", tip="tip1")
+    m_checkout.assert_called_once_with("tip1")
     m_git.assert_not_called()
     m_prompt.assert_called_once()
-    assert Contains("git checkout -b") in caplog.messages
+    m_config.create_branch = True
 
-    # HEAD is already detached, eg. when applying at another base after a
-    # failed attempt: there's nothing left to ask about.
+    # HEAD is already detached: there's nothing left to ask about.
     m_prompt.reset_mock()
     m_is_detached_head.return_value = True
-    git.args = Args(no_branch=True)
-    git.before_patch("abcdef", "name")
+    after_patch("abcdef", "name", tip="tip1", no_branch=True)
     m_prompt.assert_not_called()
     m_is_detached_head.return_value = False
 
     m_prompt.return_value = "No"
-    with pytest.raises(SystemExit):
-        git.before_patch("abcdef", "name")
-
-    # The target is already checked out (eg. `--apply-to here`): checking it
-    # out again would only detach HEAD from the branch it's on.
-    m_prompt.reset_mock()
     m_checkout.reset_mock()
+    with pytest.raises(SystemExit):
+        after_patch("abcdef", "name", tip="tip1", no_branch=True)
+    m_checkout.assert_not_called()
+
+    # Committed on the current commit (eg. `--apply-to here`): move whatever
+    # HEAD points at, rather than detaching it.
+    m_prompt.reset_mock()
     caplog.clear()
-    git.args = Args(applyto="here", no_branch=True)
-    git.before_patch("current_sha", "name")
+    after_patch("current_sha", "name", tip="tip1", no_branch=True)
     m_checkout.assert_not_called()
     m_prompt.assert_not_called()
+    m_git.assert_called_once_with(["reset", "--quiet", "--keep", "tip1"])
     assert Contains("git checkout -b") not in caplog.messages
 
     # Same, but HEAD is already detached: the commits still end up on a
     # detached HEAD, so the hint about retaining them is still relevant.
     caplog.clear()
     m_is_detached_head.return_value = True
-    git.before_patch("current_sha", "name")
+    after_patch("current_sha", "name", tip="tip1", no_branch=True)
     m_prompt.assert_not_called()
     assert Contains("git checkout -b") in caplog.messages
     m_is_detached_head.return_value = False
 
 
-@mock.patch("mozphab.git.Git.git_call")
-@mock.patch("mozphab.git.Git.checkout")
-def test_discard_patch_attempt(m_checkout, m_git_call, git):
-    # Without a branch of our own the commits may have advanced the branch
-    # HEAD is on, so reset it before detaching at `node`.
-    git.patch_branch_name = None
-    git.discard_patch_attempt("sha111")
-    m_git_call.assert_called_once_with(["reset", "--hard", "--quiet", "sha111"])
-    m_checkout.assert_called_once_with("sha111")
+@mock.patch("mozphab.git.Git.git_out_text")
+def test_commit_patch(m_git_out_text, git):
+    m_git_out_text.side_effect = ("", "", "tree1", "commit1")
+    git.ident_env = {"GIT_COMMITTER_NAME": "jj user"}
 
-    m_git_call.reset_mock()
-    m_checkout.reset_mock()
-    git.patch_branch_name = "phab-D1"
-    git.discard_patch_attempt("sha111")
-    m_checkout.assert_called_once_with("sha111")
-    m_git_call.assert_called_once_with(["branch", "--delete", "--force", "phab-D1"])
-    assert git.patch_branch_name is None
+    assert git.commit_patch("parent1", "diff", "message", "A U Thor <a@b.c>", 1) == (
+        "commit1"
+    )
+
+    read_tree, apply, write_tree, commit_tree = m_git_out_text.call_args_list
+    index_env = read_tree.kwargs["extra_env"]
+    assert read_tree.args == (["read-tree", "parent1"],)
+    assert apply.args[0][:2] == ["apply", "--cached"]
+    assert apply.kwargs["extra_env"] == index_env
+    assert write_tree == mock.call(["write-tree"], extra_env=index_env)
+    command = commit_tree.args[0]
+    assert command[:4] == ["commit-tree", "-p", "parent1", "-F"]
+    assert command[5] == "tree1"
+    assert commit_tree.kwargs["extra_env"] == {
+        "GIT_COMMITTER_NAME": "jj user",
+        "GIT_AUTHOR_NAME": "A U Thor",
+        "GIT_AUTHOR_EMAIL": "a@b.c",
+        "GIT_AUTHOR_DATE": "1 +0000",
+    }
 
 
-@mock.patch("mozphab.git.Git.git_call")
-def test_abort_rebase(m_git_call, git):
-    # A rebase that never started leaves nothing to abort.
-    m_git_call.side_effect = exceptions.CommandError("no rebase in progress")
-    git.abort_rebase()
-    m_git_call.assert_called_once_with(["rebase", "--abort"])
+@mock.patch("mozphab.git.Git._commit_tree")
+@mock.patch("mozphab.git.Git.git_out_text")
+@mock.patch("mozphab.git.Git.git_out")
+def test_rebase_commits(m_git_out, m_git_out_text, m_commit_tree, git):
+    m_git_out.return_value = ["c1", "c2"]
+    m_git_out_text.side_effect = (
+        "tree1",
+        "user\nuser@example.com\n1 +0000\ntitle 1\n\nbody\n",
+        "tree2",
+        "user\nuser@example.com\n2 +0000\ntitle 2\n",
+    )
+    m_commit_tree.side_effect = ("new1", "new2")
 
-
-@mock.patch("mozphab.git.temporary_binary_file")
-@mock.patch("mozphab.git.Git.git_call")
-@mock.patch("mozphab.git.Git.commit")
-def test_apply_patch(m_commit, m_git, m_temp_fn, git):
-    m_temp_fn.return_value = create_temp_fn("filename")
-    git.apply_patch("diff", "commit message", "user", 1)
-    m_git.assert_called_once_with(["apply", "--index", "filename"])
-    m_commit.assert_called_with("commit message", "user", 1)
-    m_temp_fn.assert_called_once_with(b"diff")
+    assert git.rebase_commits("base", "c2", "dest") == "new2"
+    m_git_out.assert_called_once_with(["rev-list", "--reverse", "base..c2"])
+    assert m_git_out_text.call_args_list[0] == mock.call(
+        ["merge-tree", "--write-tree", "--merge-base=c1^", "dest", "c1"]
+    )
+    assert m_git_out_text.call_args_list[2] == mock.call(
+        ["merge-tree", "--write-tree", "--merge-base=c2^", "new1", "c2"]
+    )
+    assert m_commit_tree.call_args_list == [
+        mock.call(
+            "dest", "tree1", "title 1\n\nbody\n", "user", "user@example.com", "1 +0000"
+        ),
+        mock.call("new1", "tree2", "title 2\n", "user", "user@example.com", "2 +0000"),
+    ]
 
 
 @mock.patch("mozphab.git.Git.git_out_text")
@@ -917,31 +913,6 @@ def test_git_validate_email(git):
 
     git.git.email = "test@mozilla.com"
     assert git.validate_email() is None, "validate_email() executes without error"
-
-
-@pytest.mark.parametrize("branch", [None, "phab-D1"])
-@mock.patch("mozphab.git.Git.git_call")
-@mock.patch("mozphab.git.Git.checkout")
-def test_discard_patch_attempt_keeps_branch(m_checkout, m_git_call, git, branch):
-    git.patch_branch_name = branch
-    git.discard_patch_attempt("sha111", keep_branch=True)
-    m_git_call.assert_called_once_with(["reset", "--hard", "--quiet", "sha111"])
-    m_checkout.assert_not_called()
-    assert git.patch_branch_name == branch
-
-
-@mock.patch("mozphab.git.Git.git_call")
-@mock.patch("mozphab.git.Git.checkout")
-def test_discard_patch_attempt_restores_original_branch(
-    m_checkout, m_git_call, git
-):
-    git.patch_branch_name = "phab-D1"
-    git.discard_patch_attempt(
-        "sha111", keep_branch=True, original_branch="feature"
-    )
-    m_checkout.assert_called_once_with("feature")
-    m_git_call.assert_called_once_with(["branch", "--delete", "--force", "phab-D1"])
-    assert git.patch_branch_name is None
 
 
 @pytest.mark.parametrize(

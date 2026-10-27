@@ -21,7 +21,9 @@ def jj():
     """
     jj = object.__new__(Jujutsu)
     jj._Jujutsu__git_repo = mock.Mock()  # type: ignore
-    jj._Jujutsu__patch_branch_name = ""  # type: ignore
+    jj._Jujutsu__patch_base = ""  # type: ignore
+    jj._Jujutsu__patch_tip = ""  # type: ignore
+    jj._Jujutsu__patch_name = None  # type: ignore
     return jj
 
 
@@ -50,22 +52,64 @@ def test_set_args_shares_args_with_git_repo(jj):
     assert jj._Jujutsu__git_repo.args is args
 
 
-@mock.patch("mozphab.jujutsu.check_call")
-def test_discard_patch_attempt_abandons_bookmark_and_commits(m_check_call, jj):
-    jj._Jujutsu__patch_branch_name = "phab-D1"
+def test_patch_commits_and_rebases_with_git(jj):
+    git_repo = jj._Jujutsu__git_repo
+    git_repo.commit_patch.side_effect = ("commit1", "commit2")
+    git_repo.rebase_commits.return_value = "rebased2"
 
-    jj.discard_patch_attempt("sha111")
-    assert m_check_call.call_args_list == [
-        mock.call(["jj", "bookmark", "delete", "--quiet", "phab-D1"]),
-        mock.call(["jj", "abandon", "--quiet", "sha111..@"]),
+    jj.before_patch("base", "phab-D1")
+    jj.apply_patch("diff1", "body1", "user <a@b.c>", 1)
+    jj.apply_patch("diff2", "body2", None, None)
+    jj.rebase_node("base", "dest")
+
+    assert git_repo.commit_patch.call_args_list == [
+        mock.call("base", "diff1", "body1", "user <a@b.c>", 1),
+        mock.call("commit1", "diff2", "body2", None, None),
     ]
-    assert jj._Jujutsu__patch_branch_name == ""
+    git_repo.rebase_commits.assert_called_once_with("base", "commit2", "dest")
+    assert jj._Jujutsu__patch_tip == "rebased2"
+    assert jj._Jujutsu__patch_base == "dest"
+
+
+@pytest.mark.parametrize("no_branch", [False, True])
+@mock.patch("mozphab.jujutsu.uuid.uuid4", return_value=mock.Mock(hex="abc"))
+@mock.patch.object(Jujutsu, "_Jujutsu__check_output", return_value=["phab-D1"])
+@mock.patch("mozphab.jujutsu.check_call")
+def test_after_patch_imports_and_checks_out_commits(
+    m_check_call, m_check_output, m_uuid4, jj, no_branch
+):
+    jj.args = argparse.Namespace(no_branch=no_branch)
+    jj._Jujutsu__patch_base = "base"
+    jj._Jujutsu__patch_tip = "tip"
+    jj._Jujutsu__patch_name = "phab-D1"
+
+    jj.after_patch()
+
+    ref_name = "mozphab-patch-abc" if no_branch else "phab-D1_1"
+    jj._Jujutsu__git_repo.git_call.assert_called_once_with(
+        ["update-ref", f"refs/heads/{ref_name}", "tip"]
+    )
+    expected = [
+        mock.call(["jj", "git", "import", "--quiet"]),
+        mock.call(["jj", "new", "--quiet", "tip"]),
+    ]
+    if no_branch:
+        expected += [
+            mock.call(["jj", "bookmark", "delete", "--quiet", ref_name]),
+            mock.call(["jj", "git", "export", "--quiet"]),
+        ]
+    assert m_check_call.call_args_list == expected
 
 
 @mock.patch("mozphab.jujutsu.check_call")
-def test_discard_patch_attempt_without_a_bookmark(m_check_call, jj):
-    jj.discard_patch_attempt("sha111")
-    m_check_call.assert_called_once_with(["jj", "abandon", "--quiet", "sha111..@"])
+def test_after_patch_without_commits(m_check_call, jj):
+    jj.args = argparse.Namespace(no_branch=False)
+    jj._Jujutsu__patch_base = jj._Jujutsu__patch_tip = "base"
+
+    jj.after_patch()
+
+    jj._Jujutsu__git_repo.git_call.assert_not_called()
+    m_check_call.assert_called_once_with(["jj", "new", "--quiet", "base"])
 
 
 @mock.patch.object(Jujutsu, "_Jujutsu__cli_log_text")

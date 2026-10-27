@@ -2,7 +2,7 @@ import argparse
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from packaging.version import Version
@@ -17,7 +17,6 @@ from .git import Git
 from .helpers import (
     is_valid_email,
     short_node,
-    temporary_binary_file,
     temporary_file,
 )
 from .logger import logger
@@ -108,12 +107,24 @@ class Jujutsu(Repository):
 
         self.revset = None
         self.branch = None
-        # Name of the bookmark created by `before_patch`, empty if none.
-        self.__patch_branch_name = ""
+        # Commit `before_patch` was given, the last commit created on top of
+        # it, and the name of the bookmark `after_patch` should create.
+        self.__patch_base = ""
+        self.__patch_tip = ""
+        self.__patch_name: str | None = None
 
         self.__email = self.__check_output_text(
             ["jj", "config", "get", "user.email"]
         ).rstrip()
+        name = self.__check_output_text(["jj", "config", "get", "user.name"]).rstrip()
+        # The patches are committed with Git, which may not be configured with
+        # the identity `jj` commits with.
+        self.__git_repo.ident_env = {
+            f"GIT_{role}_{key}": value
+            for role in ("AUTHOR", "COMMITTER")
+            for key, value in (("NAME", name), ("EMAIL", self.__email))
+            if value
+        }
 
     def __check_and_get_version(self) -> tuple[str, Version]:
         min_version = Jujutsu.MIN_VERSION
@@ -371,10 +382,11 @@ class Jujutsu(Repository):
         return self.__cli_log_text(template='commit_id ++ "\\n"', revset="@")
 
     def rebase_node(self, source_node: str, dest_node: str):
-        # `source_node` is a shared ancestor (eg. a public commit) that must
-        # stay put, so select the exact range to move with a revset instead
-        # of `--source`/`--branch`, which would also move `source_node`.
-        check_call(["jj", "rebase", "-r", f"{source_node}..@", "--onto", dest_node])
+        """Rebase the commits created since `before_patch` onto `dest_node`."""
+        self.__patch_tip = self.__git_repo.rebase_commits(
+            source_node, self.__patch_tip, dest_node
+        )
+        self.__patch_base = dest_node
 
     def get_public_base_node(self, node: str) -> str | None:
         """Return the public ancestor automation should use as the diff base."""
@@ -413,18 +425,27 @@ class Jujutsu(Repository):
             return self.__git_repo.check_node(node)
 
     def before_patch(self, node: str, name: str):
-        """Prepare repository to apply the patches.
+        """Prepare to commit the patches on top of `node`.
+
+        Nothing is checked out until `after_patch`, so a failed attempt leaves
+        the working copy untouched.
 
         Args:
             node - SHA1 of the base commit
             name - name of the bookmark to be created
         """
+        self.__patch_base = node or self.get_current_node()
+        self.__patch_tip = self.__patch_base
+        self.__patch_name = name
 
-        if node:
-            with wait_message("Checking out %s.." % short_node(node)):
-                check_call(["jj", "new", "--quiet", node])
-            logger.info("Checked out %s", short_node(node))
+    def after_patch(self):
+        """Check out the commits created since `before_patch`.
 
+        Only the files that differ from the current working copy are written.
+        """
+        tip = self.__patch_tip
+        name = self.__patch_name
+        bookmark = ""
         if name and not self.args.no_branch and config.create_branch:
             branches = set(
                 self.__check_output(
@@ -433,81 +454,43 @@ class Jujutsu(Repository):
                 )
             )
             branches = [re.sub("[ *]", "", b) for b in branches]
-            branch_name = name
+            bookmark = name
             i = 0
-            while branch_name in branches:
+            while bookmark in branches:
                 i += 1
-                branch_name = "%s_%s" % (name, i)
+                bookmark = "%s_%s" % (name, i)
 
-            check_call(
-                ["jj", "bookmark", "create", "--quiet", "--revision=@", branch_name]
-            )
-            logger.info("Created bookmark %s", branch_name)
-            self.__patch_branch_name = branch_name
+        ref_name = bookmark or "mozphab-patch-%s" % uuid.uuid4().hex
+        if tip != self.__patch_base:
+            # `jj` only knows about the commits a Git ref points to.
+            self.__git_repo.git_call(["update-ref", f"refs/heads/{ref_name}", tip])
+            check_call(["jj", "git", "import", "--quiet"])
+
+        with wait_message("Checking out %s.." % short_node(tip)):
+            check_call(["jj", "new", "--quiet", tip])
+        logger.info("Checked out %s", short_node(tip))
+
+        if bookmark:
+            logger.info("Created bookmark %s", bookmark)
+        elif tip != self.__patch_base:
+            check_call(["jj", "bookmark", "delete", "--quiet", ref_name])
+            check_call(["jj", "git", "export", "--quiet"])
 
     def discard_patch_attempt(
-        self, node: str, *, keep_branch: bool = False, original_branch: str | None = None
+        self,
+        node: str,
+        *,
+        keep_branch: bool = False,
+        original_branch: str | None = None,
     ):
-        """Undo a failed patch attempt, returning the repository to `node`.
-
-        Unlike Git, `jj` keeps abandoned commits and bookmarks visible in
-        `jj log`, so both are removed rather than left for garbage collection.
-        """
-        if self.__patch_branch_name:
-            check_call(
-                ["jj", "bookmark", "delete", "--quiet", self.__patch_branch_name]
-            )
-            self.__patch_branch_name = ""
-
-        # Abandoning the working-copy commit moves `@` back to `node`, with a
-        # new, empty commit on top.
-        check_call(["jj", "abandon", "--quiet", f"{node}..@"])
+        """Nothing to undo: `jj` never saw the commits of a failed attempt."""
 
     def apply_patch(
         self, diff: str, body: str, author: str | None, author_date: int | None
     ):
-        # NOTE: `before_patch` ensures that we are editing a new, empty commit on the base we want.
-
-        # apply the patch as a binary file to ensure the correct line endings
-        # is used.
-        # TODO: Use `jj`'s built-in patching facilities when it exists (see
-        # <https://github.com/martinvonz/jj/issues/2702>).
-        with temporary_binary_file(diff.encode("utf8")) as patch_file:
-            # NOTE: We avoid `self.__git_repo.git_call` because it changes the CWD.
-            self.__git_repo.git.call(["apply", patch_file], cwd=self.path)
-
-        # TODO: dedupe with other `describe` usage
-        with temporary_file(body) as message_path:
-            with open(message_path) as message_file:
-                check_call(["jj", "describe", "--quiet", "--stdin"], stdin=message_file)
-        # Only set the fields Phabricator gave us, as `git` and `hg` do.
-        metaedit_command = ["jj", "metaedit", "--quiet"]
-        if author:
-            metaedit_command.extend(["--author", author])
-        if author_date is not None:
-            timestamp = datetime.fromtimestamp(author_date, tz=timezone.utc).isoformat()
-            metaedit_command.extend(["--author-timestamp", timestamp])
-
-        if len(metaedit_command) > 3:
-            check_call(metaedit_command)
-
-        check_call(["jj", "new", "--quiet"])
-
-        if not self.args.no_branch and config.create_branch:
-            # # Advance the bookmark we created for this patch. Because we know we're creating
-            # entirely new commits, and we have the branch at the parent commit, we can let `--from`
-            # compensate for the fact that we otherwise don't remember the name of the branch.
-
-            check_call(
-                [
-                    "jj",
-                    "bookmark",
-                    "move",
-                    "--quiet",
-                    self.__patch_branch_name,
-                    "--to=@-",
-                ]
-            )
+        self.__patch_tip = self.__git_repo.commit_patch(
+            self.__patch_tip, diff, body, author, author_date
+        )
 
     def format_patch(
         self, diff: str, body: str, author: str | None, author_date: int | None

@@ -11,7 +11,7 @@ import pytest
 from mozphab import mozphab
 from mozphab.exceptions import Error
 
-from .conftest import git_out, hg_out, with_stack_graph
+from .conftest import git_out, hg_out, jj_out, with_stack_graph
 
 
 @mock.patch("mozphab.conduit.ConduitAPI.get_revisions")
@@ -380,6 +380,124 @@ def test_git_patch_here_no_branch_declines_fallback(
     assert not git_out("status", "--porcelain").strip()
 
 
+def setup_diverged_base(repo_path, commit):
+    """Commit a base, then a local change the patch only applies to via a rebase.
+
+    Returns the base commit, and the stat of a file the patch doesn't touch.
+    """
+    (repo_path / "X").write_text(DIVERGED_X)
+    base = commit("base")
+    (repo_path / "X").write_text(DIVERGED_X.replace("5\n", "five\n"))
+    (repo_path / "local").write_text("local\n")
+    commit("local change")
+    return base, (repo_path / "local").stat()
+
+
+def conduit_dispatcher(base):
+    diff = copy.deepcopy(DIFF_1)
+    diff["fields"]["refs"][0]["identifier"] = base
+    return {"PHID-DIFF-1": diff}, lambda method, args: {
+        "conduit.ping": {},
+        "diffusion.repository.search": {
+            "data": [{"phid": "PHID-REPO-1", "fields": {"vcs": "git"}}]
+        },
+        "differential.getrawdiff": DIVERGED_PATCH,
+    }[method]
+
+
+def assert_untouched(path, stat):
+    assert (path.stat().st_ino, path.stat().st_mtime_ns) == (
+        stat.st_ino,
+        stat.st_mtime_ns,
+    )
+
+
+@mock.patch("mozphab.git.Git.is_public", return_value=True)
+@mock.patch("mozphab.conduit.ConduitAPI.get_revisions")
+@mock.patch("mozphab.conduit.ConduitAPI.get_diffs")
+@mock.patch("mozphab.conduit.ConduitAPI.call")
+def test_git_patch_rebase_leaves_worktree_untouched(
+    m_call_conduit,
+    m_get_diffs,
+    m_get_revs,
+    m_is_public,
+    in_process,
+    git_repo_path,
+):
+    """Applying at the base and rebasing only writes the files the patch changes."""
+
+    def commit(message):
+        git_out("add", ".")
+        git_out("commit", "--message", message)
+        return git_out("rev-parse", "HEAD").strip()
+
+    base, local_stat = setup_diverged_base(git_repo_path, commit)
+    tip = git_out("rev-parse", "HEAD").strip()
+    m_get_revs.return_value = [REV_1]
+    m_get_diffs.return_value, m_call_conduit.side_effect = conduit_dispatcher(base)
+
+    mozphab.main(["patch", "D1", "--apply-to", "here", "--yes"], is_development=True)
+
+    assert (git_repo_path / "X").read_text() == DIVERGED_X.replace(
+        "2\n", "two\n"
+    ).replace("5\n", "five\n")
+    assert_untouched(git_repo_path / "local", local_stat)
+    assert git_out("rev-parse", "HEAD^").strip() == tip
+    assert git_out("symbolic-ref", "--short", "HEAD").strip() == "phab-D1"
+    assert git_out("log", "-1", "--format=%an <%ae> %at%n%B") == (
+        "user <author@example.com> 1547806078\n"
+        "title R1\n\n\u0105\n\nDifferential Revision: http://example.test/D1\n\n"
+    )
+    assert not git_out("status", "--porcelain").strip()
+
+
+@pytest.mark.parametrize("no_branch", [False, True], ids=["bookmark", "no-bookmark"])
+@mock.patch("mozphab.git.Git.is_public", return_value=True)
+@mock.patch("mozphab.conduit.ConduitAPI.get_revisions")
+@mock.patch("mozphab.conduit.ConduitAPI.get_diffs")
+@mock.patch("mozphab.conduit.ConduitAPI.call")
+def test_jj_patch_rebase_leaves_working_copy_untouched(
+    m_call_conduit,
+    m_get_diffs,
+    m_get_revs,
+    m_is_public,
+    in_process,
+    jj_colocated_repo_path,
+    no_branch,
+):
+    """Applying at the base and rebasing only writes the files the patch changes."""
+
+    def commit(message):
+        jj_out("commit", "--message", message)
+        return jj_out("log", "--no-graph", "-r", "@-", "-T", "commit_id").strip()
+
+    base, local_stat = setup_diverged_base(jj_colocated_repo_path, commit)
+    m_get_revs.return_value = [REV_1]
+    m_get_diffs.return_value, m_call_conduit.side_effect = conduit_dispatcher(base)
+
+    args = ["patch", "D1", "--apply-to", "here", "--yes"]
+    if no_branch:
+        args.append("--no-branch")
+    mozphab.main(args, is_development=True)
+
+    assert (jj_colocated_repo_path / "X").read_text() == DIVERGED_X.replace(
+        "2\n", "two\n"
+    ).replace("5\n", "five\n")
+    assert_untouched(jj_colocated_repo_path / "local", local_stat)
+    log = jj_out(
+        "log",
+        "--no-graph",
+        "-r",
+        "@--::",
+        "-T",
+        'description.first_line() ++ " [" ++ bookmarks ++ "]\n"',
+    )
+    # The empty working-copy commit patched "here", the patch, and a new one.
+    assert log == " []\ntitle R1 [%s]\n []\n" % ("" if no_branch else "phab-D1")
+    assert ("phab-D1" in jj_out("bookmark", "list")) != no_branch
+    assert "mozphab-patch" not in jj_out("bookmark", "list")
+
+
 @mock.patch("mozphab.mercurial.Mercurial.is_public", return_value=True)
 @mock.patch("mozphab.conduit.ConduitAPI.get_revisions")
 @mock.patch("mozphab.conduit.ConduitAPI.get_diffs")
@@ -659,5 +777,20 @@ O!n%`!v-e$`d$Yhe6Zzr*
 literal 0
 Hc$@<O00001
 
+
+"""
+
+DIVERGED_X = "".join("%s\n" % i for i in range(1, 11))
+DIVERGED_PATCH = """\
+diff --git a/X b/X
+--- a/X
++++ b/X
+@@ -1,5 +1,5 @@
+ 1
+-2
++two
+ 3
+ 4
+ 5
 
 """

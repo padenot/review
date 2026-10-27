@@ -547,6 +547,8 @@ def patch(repo: Repository, args: argparse.Namespace):
             current_branch = repo.get_current_branch()
 
         repo.before_patch(target_node, branch_name)
+        if no_commit:
+            repo.after_patch()
 
     # Fetch raw diffs in parallel.
     raw_diffs = {}
@@ -663,6 +665,7 @@ def patch(repo: Repository, args: argparse.Namespace):
                     repo.rebase_node(base_node, target_node)
             except CommandError:
                 repo.abort_rebase()
+                repo.after_patch()
                 message = (
                     "Failed to rebase the patches to %s; they have been left "
                     "applied at %s." % (short_node(target_node), short_node(base_node))
@@ -672,6 +675,8 @@ def patch(repo: Repository, args: argparse.Namespace):
                 raise Error(message)
 
             logger.info("Successfully rebased patches to %s", short_node(target_node))
+
+        repo.after_patch()
 
     logger.warning("D%s applied", rev_id)
 

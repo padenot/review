@@ -245,6 +245,13 @@ class Repository(object):
     def before_patch(self, node, name):
         """Prepare repository to apply the patches."""
 
+    def after_patch(self):
+        """Check out the patches applied since `before_patch`.
+
+        Only needed by VCSs that commit the patches without touching the
+        working tree.
+        """
+
     def discard_patch_attempt(
         self, node: str, *, keep_branch: bool = False, original_branch: str | None = None
     ):
